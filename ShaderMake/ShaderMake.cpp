@@ -981,17 +981,62 @@ bool ConvertSpirvToMsl(const char* spirvFile, const char* mslFile, const TaskDat
     else if (taskData.profile == "hs") stage = spv::ExecutionModelTessellationControl;
     else if (taskData.profile == "ds") stage = spv::ExecutionModelTessellationEvaluation;
 
-    try
+    // Convert with discrete resource bindings. If the shader contains unsized
+    // descriptor arrays (bindless), Metal can only express them with argument
+    // buffers: spirv-cross rejects such shaders with an "...argument buffer tier"
+    // error, and we retry in argument-buffer mode. In AB mode every descriptor
+    // set is bound as ONE buffer; set 2 and above (the nvrhi bindless range)
+    // map their argument buffer to buffer index 28.
+    for (int useArgumentBuffers = 0; useArgumentBuffers < 2; useArgumentBuffers++)
     {
-        spirv_cross::CompilerMSL compiler(std::move(spirv));
+        vector<uint32_t> spirvCopy = spirv; // each attempt consumes its own copy
+        spirv_cross::CompilerMSL compiler(std::move(spirvCopy));
 
         spirv_cross::CompilerMSL::Options mslOptions;
         mslOptions.platform = spirv_cross::CompilerMSL::Options::macOS;
         mslOptions.msl_version = g_Options.mslVersion; // major*10000 + minor*100 + patch
+        if (useArgumentBuffers)
+        {
+            mslOptions.argument_buffers = true;
+            mslOptions.argument_buffers_tier = spirv_cross::CompilerMSL::Options::ArgumentBuffersTier::Tier2;
+        }
         compiler.set_msl_options(mslOptions);
 
+        // Runtime-sized arrays (bindless) must live in device-storage argument
+        // buffers; the nvrhi bindless range starts at register space 1.
+        if (useArgumentBuffers)
+        {
+            compiler.set_argument_buffer_device_address_space(1, true);
+            compiler.set_argument_buffer_device_address_space(2, true);
+
+            // Keep set 0 as discrete classic bindings ([[buffer(N)]]/[[texture(N)]])
+            // handled by the normal runtime binder. Bindless sets (>= 1) become
+            // argument buffers, each bound as one buffer at index 26 + set
+            // (space 1 -> buffer 27, space 2 -> buffer 28); see the slot
+            // convention in include/nvrhi/metal.h.
+            compiler.add_discrete_descriptor_set(0);
+
+            for (uint32_t abSet = 1; abSet < 8; abSet++)
+            {
+                spirv_cross::MSLResourceBinding abRb = {};
+                abRb.stage = stage;
+                abRb.desc_set = abSet;
+                abRb.binding = spirv_cross::kArgumentBufferBinding;
+                abRb.msl_buffer = 26 + abSet;
+                compiler.add_msl_resource_binding(abRb);
+            }
+        }
+
+        try
+        {
         auto addBinding = [&](spirv_cross::ID id, uint32_t mslBuffer, uint32_t mslTexture, uint32_t mslSampler)
         {
+            if (useArgumentBuffers)
+            {
+                uint32_t set = compiler.get_decoration(id, spv::DecorationDescriptorSet);
+                if (set >= 1)
+                    return; // bindless AB sets: descriptor offsets are assigned by spirv-cross
+            }
             spirv_cross::MSLResourceBinding rb = {};
             rb.stage = stage;
             rb.desc_set = compiler.get_decoration(id, spv::DecorationDescriptorSet);
@@ -1106,9 +1151,15 @@ bool ConvertSpirvToMsl(const char* spirvFile, const char* mslFile, const TaskDat
     }
     catch (const std::exception& e)
     {
+        // Unsized descriptor arrays can only be rendered as Metal argument
+        // buffers; retry the whole conversion in argument-buffer mode.
+        if (useArgumentBuffers == 0 && strstr(e.what(), "argument buffer") != nullptr)
+            continue;
+
         msg << "spirv-cross error: " << e.what() << "\n";
         return false;
     }
+    } // for (useArgumentBuffers)
 #endif
 }
 
