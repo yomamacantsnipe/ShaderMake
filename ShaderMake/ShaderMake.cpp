@@ -950,9 +950,10 @@ bool ReadBinaryFile(const char* file, vector<uint8_t>& outData)
 
 // Converts an intermediate SPIR-V binary to MSL source, remapping resources
 // to the nvrhi Metal argument index convention (see include/nvrhi/metal.h):
-//   cbuffer b#   -> [[buffer(16 + slot + 8*space)]]
-//   SRV buffer t#-> [[buffer(8 + slot)]]
-//   UAV buffer u#-> [[buffer(24 + slot)]]
+//   cbuffer b#   -> [[buffer(6 + 4*space + slot)]]  (space 0..3, slot 0..3)
+//   SRV buf t#   -> [[buffer(22 + slot)]]          (slots 0..7)
+//                    or [[buffer(22 + slot - 8)]]   (slots 8+)
+//   UAV buf u#   -> [[buffer(29 - slot)]]          (counts down from 29)
 //   push consts  -> [[buffer(30)]]
 //   texture t#   -> [[texture(slot + 32*space)]]
 //   UAV image u# -> [[texture(96 + slot)]]
@@ -1007,15 +1008,21 @@ bool ConvertSpirvToMsl(const char* spirvFile, const char* mslFile, const TaskDat
         {
             uint32_t set = compiler.get_decoration(r.id, spv::DecorationDescriptorSet);
             uint32_t slot = compiler.get_decoration(r.id, spv::DecorationBinding) - g_Options.bRegShift;
-            addBinding(r.id, 16 + slot + 8 * set, 0, 0);
+            addBinding(r.id, 6 + 4 * set + slot, 0, 0);
         }
         for (const auto& r : res.storage_buffers)
         {
             uint32_t binding = compiler.get_decoration(r.id, spv::DecorationBinding);
             if (binding >= g_Options.uRegShift)
-                addBinding(r.id, 24 + (binding - g_Options.uRegShift), 0, 0); // UAV buffer
+            {
+                uint32_t slot = binding - g_Options.uRegShift; // UAV buffer u#
+                addBinding(r.id, 29 - slot, 0, 0);
+            }
             else
-                addBinding(r.id, 8 + (binding - g_Options.tRegShift), 0, 0); // read-only SRV buffer
+            {
+                uint32_t slot = binding - g_Options.tRegShift; // read-only SRV buffer t#
+                addBinding(r.id, 22 + (slot < 8 ? slot : slot - 8), 0, 0);
+            }
         }
         for (const auto& r : res.sampled_images)
         {
@@ -1558,6 +1565,10 @@ bool ProcessConfigLine(uint32_t lineIndex, const string& line, const fs::file_ti
     // DXBC: skip unsupported profiles
     string profile = configLine.profile;
     if (g_Options.platform == DXBC && (profile == "lib" || profile == "ms" || profile == "as"))
+        return true;
+
+    // MSL: Metal has no geometry/tessellation/mesh shaders; skip those profiles
+    if (g_Options.platform == MSL && (profile == "gs" || profile == "hs" || profile == "ds" || profile == "ms" || profile == "as" || profile == "lib"))
         return true;
 
     // Getting the sorted index of defines. While doing this, the value of defines are also get included in sorting problem
