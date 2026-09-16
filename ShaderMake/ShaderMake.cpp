@@ -41,6 +41,10 @@ THE SOFTWARE.
 #include <cstring>
 #include <system_error>
 
+#if defined(SHADERMAKE_WITH_SPIRV_CROSS)
+    #include <spirv_cross/spirv_msl.hpp>
+#endif
+
 #ifdef _WIN32
     #include <windows.h>
 #else
@@ -73,6 +77,7 @@ enum Platform : uint8_t
     DXBC,
     DXIL,
     SPIRV,
+    MSL,
 
     PLATFORMS_NUM
 };
@@ -124,6 +129,11 @@ struct Options
     bool noRegShifts = false;
     bool compactProgress = false;
 
+    // MSL-specific options
+    const char* mslTargetOS = "macOS";
+    bool mslTextureBuffer = false;
+    uint32_t mslVersion = 22000;
+
     bool Parse(int32_t argc, const char** argv);
 
     inline bool IsBlob() const
@@ -135,6 +145,7 @@ struct ConfigLine
     vector<string> defines;
     vector<string> compilerOptionsDXIL;
     vector<string> compilerOptionsSPIRV;
+    vector<string> compilerOptionsMSL;
     const char* source = nullptr;
     const char* entryPoint = "main";
     const char* profile = nullptr;
@@ -152,6 +163,7 @@ struct TaskData
     vector<string> defines;
     vector<string> compilerOptionsDXIL;
     vector<string> compilerOptionsSPIRV;
+    vector<string> compilerOptionsMSL;
     string source;
     string entryPoint;
     string profile;
@@ -180,22 +192,25 @@ atomic<uint32_t> g_FailedTaskCount = 0;
 uint32_t g_OriginalTaskCount;
 const char* g_OutputExt = nullptr;
 
-std::array<const char*, 3> g_PlatformNames = {
+std::array<const char*, 4> g_PlatformNames = {
     "DXBC",
     "DXIL",
     "SPIRV",
+    "MSL",
 };
 
-std::array<const char*, 3> g_PlatformExts = {
+std::array<const char*, 4> g_PlatformExts = {
     ".dxbc",
     ".dxil",
     ".spirv",
+    ".msl",
 };
 
-std::array<const char*, 3> g_PlatformSlangTargets = {
+std::array<const char*, 4> g_PlatformSlangTargets = {
     "dxbc",
     "dxil",
     "spirv",
+    nullptr, // MSL not supported by Slang directly
 };
 
 #if 1
@@ -628,7 +643,7 @@ bool Options::Parse(int32_t argc, const char** argv)
     struct argparse_option options[] = {
         OPT_HELP(),
         OPT_GROUP("Required options:"),
-            OPT_STRING('p', "platform", &platformName, "DXBC, DXIL or SPIRV", nullptr, 0, 0),
+            OPT_STRING('p', "platform", &platformName, "DXBC, DXIL, SPIRV or MSL", nullptr, 0, 0),
             OPT_STRING('c', "config", &config, "Configuration file with the list of shaders to compile", nullptr, 0, 0),
             OPT_STRING('o', "out", &outputDir, "Output directory", nullptr, 0, 0),
             OPT_BOOLEAN('b', "binary", &binary, "Output binary files", nullptr, 0, 0),
@@ -637,7 +652,7 @@ bool Options::Parse(int32_t argc, const char** argv)
             OPT_BOOLEAN('H', "headerBlob", &headerBlob, "Output header blob files", nullptr, 0, 0),
             OPT_STRING(0, "compiler", &compiler, "Path to a FXC/DXC/Slang compiler executable", nullptr, 0, 0),
         OPT_GROUP("Compiler settings:"),
-            OPT_STRING('m', "shaderModel", &shaderModel, "Shader model for DXIL/SPIRV (always SM 5.0 for DXBC): major_minor (e.g. 6_5, 6_10)", nullptr, 0, 0),
+             OPT_STRING('m', "shaderModel", &shaderModel, "Shader model for DXIL/SPIRV/MSL (always SM 5.0 for DXBC): major_minor (e.g. 6_5, 6_10)", nullptr, 0, 0),
             OPT_INTEGER('O', "optimization", &optimizationLevel, "Optimization level 0-3 (default = 3, disabled = 0)", nullptr, 0, 0),
             OPT_STRING('X', "compilerOptions", &unused, "Custom command line options for the compiler, separated by spaces", AddCompilerOptions, (intptr_t)this, 0),
             OPT_BOOLEAN(0, "WX", &warningsAreErrors, "Maps to '-WX' DXC/FXC option: warnings are errors", nullptr, 0, 0),
@@ -657,7 +672,7 @@ bool Options::Parse(int32_t argc, const char** argv)
             OPT_STRING(0, "project", &projectName, "Project name to be seen in informational output", nullptr, 0, 0),
             OPT_STRING(0, "sourceDir", &srcDir, "Source code directory", nullptr, 0, 0),
             OPT_STRING(0, "relaxedInclude", &unused, "Include file(s) not invoking re-compilation", AddRelaxedInclude, (intptr_t)this, 0),
-            OPT_STRING(0, "outputExt", &outputExt, "Extension for output files, default is one of .dxbc, .dxil, .spirv", nullptr, 0, 0),
+             OPT_STRING(0, "outputExt", &outputExt, "Extension for output files, default is one of .dxbc, .dxil, .spirv, .msl", nullptr, 0, 0),
             OPT_BOOLEAN(0, "serial", &serial, "Disable multi-threading", nullptr, 0, 0),
             OPT_BOOLEAN(0, "flatten", &flatten, "Flatten source directory structure in the output directory", nullptr, 0, 0),
             OPT_BOOLEAN(0, "continue", &continueOnError, "Continue compilation if an error is occured", nullptr, 0, 0),
@@ -674,12 +689,16 @@ bool Options::Parse(int32_t argc, const char** argv)
             OPT_INTEGER(0, "tRegShift", &tRegShift, "SPIRV: register shift for texture (t#) resources", nullptr, 0, 0),
             OPT_INTEGER(0, "bRegShift", &bRegShift, "SPIRV: register shift for constant (b#) resources", nullptr, 0, 0),
             OPT_INTEGER(0, "uRegShift", &uRegShift, "SPIRV: register shift for UAV (u#) resources", nullptr, 0, 0),
-            OPT_BOOLEAN(0, "noRegShifts", &noRegShifts, "Don't specify any register shifts for the compiler", nullptr, 0, 0),
-        OPT_END(),
+             OPT_BOOLEAN(0, "noRegShifts", &noRegShifts, "Don't specify any register shifts for the compiler", nullptr, 0, 0),
+         OPT_GROUP("MSL options:"),
+             OPT_STRING(0, "mslTargetOS", &mslTargetOS, "Target OS for MSL (macOS, iOS, tvOS) (default = macOS)", nullptr, 0, 0),
+             OPT_BOOLEAN(0, "mslTextureBuffer", &mslTextureBuffer, "Maps textures to buffer textures for MSL", nullptr, 0, 0),
+             OPT_INTEGER(0, "mslVersion", &mslVersion, "MSL version major*10000 + minor*100 + patch (default = 22000)", nullptr, 0, 0),
+         OPT_END(),
     };
 
     static const char* usages[] = {
-        "ShaderMake.exe -p {DXBC|DXIL|SPIRV} --binary [--header --blob] -c \"path/to/config\"\n"
+        "ShaderMake.exe -p {DXBC|DXIL|SPIRV|MSL} --binary [--header --blob] -c \"path/to/config\"\n"
         "\t-o \"path/to/output\" --compiler \"path/to/compiler\" [other options]\n"
         "\t-D DEF1 -D DEF2=1 ... -I \"path1\" -I \"path2\" ...",
         nullptr
@@ -838,6 +857,9 @@ int32_t AddCompilerOptionsDXIL(struct argparse* self, const struct argparse_opti
 int32_t AddCompilerOptionsSPIRV(struct argparse* self, const struct argparse_option* option)
 { ((ConfigLine*)(option->data))->compilerOptionsSPIRV.push_back(*(const char**)option->value); UNUSED(self); return 0; }
 
+int32_t AddCompilerOptionsMSL(struct argparse* self, const struct argparse_option* option)
+{ ((ConfigLine*)(option->data))->compilerOptionsMSL.push_back(*(const char**)option->value); UNUSED(self); return 0; }
+
 bool ConfigLine::Parse(int32_t argc, const char** argv)
 {
     source = argv[0];
@@ -854,6 +876,7 @@ bool ConfigLine::Parse(int32_t argc, const char** argv)
 
         OPT_STRING(0, "compilerOptionsDXIL", &unused, "Custom command line options for dxil, separated by spaces", AddCompilerOptionsDXIL, (intptr_t)this, 0),
         OPT_STRING(0, "compilerOptionsSPIRV", &unused, "Custom command line options for spirv, separated by spaces", AddCompilerOptionsSPIRV, (intptr_t)this, 0),
+        OPT_STRING(0, "compilerOptionsMSL", &unused, "Custom command line options for MSL (passed to spirv-cross), separated by spaces", AddCompilerOptionsMSL, (intptr_t)this, 0),
         OPT_END(),
     };
 
@@ -925,6 +948,163 @@ bool ReadBinaryFile(const char* file, vector<uint8_t>& outData)
     return success;
 }
 
+// Converts an intermediate SPIR-V binary to MSL source, remapping resources
+// to the nvrhi Metal argument index convention (see include/nvrhi/metal.h):
+//   cbuffer b#   -> [[buffer(16 + slot + 8*space)]]
+//   SRV buffer t#-> [[buffer(8 + slot)]]
+//   UAV buffer u#-> [[buffer(24 + slot)]]
+//   push consts  -> [[buffer(30)]]
+//   texture t#   -> [[texture(slot + 32*space)]]
+//   UAV image u# -> [[texture(96 + slot)]]
+//   sampler s#   -> [[sampler(slot)]]
+// SPIR-V bindings carry the HLSL slot plus the DXC register shift
+// (s: +100, t: +200, b: +300, u: +400) and the register space as descriptor set.
+bool ConvertSpirvToMsl(const char* spirvFile, const char* mslFile, const TaskData& taskData, ostringstream& msg)
+{
+#if !defined(SHADERMAKE_WITH_SPIRV_CROSS)
+    (void)spirvFile; (void)mslFile; (void)taskData;
+    msg << "ShaderMake was built without spirv-cross support; cannot emit MSL\n";
+    return false;
+#else
+    vector<uint8_t> fileData;
+    if (!ReadBinaryFile(spirvFile, fileData))
+        return false;
+
+    vector<uint32_t> spirv(fileData.size() / sizeof(uint32_t));
+    memcpy(spirv.data(), fileData.data(), fileData.size());
+
+    spv::ExecutionModel stage = spv::ExecutionModelMax;
+    if (taskData.profile == "vs") stage = spv::ExecutionModelVertex;
+    else if (taskData.profile == "ps") stage = spv::ExecutionModelFragment;
+    else if (taskData.profile == "cs") stage = spv::ExecutionModelGLCompute;
+    else if (taskData.profile == "hs") stage = spv::ExecutionModelTessellationControl;
+    else if (taskData.profile == "ds") stage = spv::ExecutionModelTessellationEvaluation;
+
+    try
+    {
+        spirv_cross::CompilerMSL compiler(std::move(spirv));
+
+        spirv_cross::CompilerMSL::Options mslOptions;
+        mslOptions.platform = spirv_cross::CompilerMSL::Options::macOS;
+        mslOptions.msl_version = g_Options.mslVersion; // major*10000 + minor*100 + patch
+        compiler.set_msl_options(mslOptions);
+
+        auto addBinding = [&](spirv_cross::ID id, uint32_t mslBuffer, uint32_t mslTexture, uint32_t mslSampler)
+        {
+            spirv_cross::MSLResourceBinding rb = {};
+            rb.stage = stage;
+            rb.desc_set = compiler.get_decoration(id, spv::DecorationDescriptorSet);
+            rb.binding = compiler.get_decoration(id, spv::DecorationBinding);
+            rb.msl_buffer = mslBuffer;
+            rb.msl_texture = mslTexture;
+            rb.msl_sampler = mslSampler;
+            compiler.add_msl_resource_binding(rb);
+        };
+
+        auto res = compiler.get_shader_resources();
+
+        for (const auto& r : res.uniform_buffers)
+        {
+            uint32_t set = compiler.get_decoration(r.id, spv::DecorationDescriptorSet);
+            uint32_t slot = compiler.get_decoration(r.id, spv::DecorationBinding) - g_Options.bRegShift;
+            addBinding(r.id, 16 + slot + 8 * set, 0, 0);
+        }
+        for (const auto& r : res.storage_buffers)
+        {
+            uint32_t binding = compiler.get_decoration(r.id, spv::DecorationBinding);
+            if (binding >= g_Options.uRegShift)
+                addBinding(r.id, 24 + (binding - g_Options.uRegShift), 0, 0); // UAV buffer
+            else
+                addBinding(r.id, 8 + (binding - g_Options.tRegShift), 0, 0); // read-only SRV buffer
+        }
+        for (const auto& r : res.sampled_images)
+        {
+            uint32_t set = compiler.get_decoration(r.id, spv::DecorationDescriptorSet);
+            uint32_t slot = compiler.get_decoration(r.id, spv::DecorationBinding) - g_Options.tRegShift;
+            addBinding(r.id, 0, slot + 32 * set, 0);
+        }
+        for (const auto& r : res.separate_images)
+        {
+            uint32_t set = compiler.get_decoration(r.id, spv::DecorationDescriptorSet);
+            uint32_t slot = compiler.get_decoration(r.id, spv::DecorationBinding) - g_Options.tRegShift;
+            addBinding(r.id, 0, slot + 32 * set, 0);
+        }
+        for (const auto& r : res.storage_images)
+        {
+            uint32_t slot = compiler.get_decoration(r.id, spv::DecorationBinding) - g_Options.uRegShift;
+            addBinding(r.id, 0, 96 + slot, 0);
+        }
+        for (const auto& r : res.separate_samplers)
+        {
+            uint32_t slot = compiler.get_decoration(r.id, spv::DecorationBinding) - g_Options.sRegShift;
+            addBinding(r.id, 0, 0, slot);
+        }
+        for (const auto& r : res.push_constant_buffers)
+        {
+            spirv_cross::MSLResourceBinding rb = {};
+            rb.stage = stage;
+            rb.desc_set = spirv_cross::ResourceBindingPushConstantDescriptorSet;
+            rb.binding = spirv_cross::ResourceBindingPushConstantBinding;
+            rb.msl_buffer = 30; // kMetalPushConstantsBufferIndex
+            compiler.add_msl_resource_binding(rb);
+        }
+
+        // spirv-cross renames the entry point to "main0" in MSL; force the
+        // original HLSL entry point name so nvrhi createShader can find it.
+        // Must happen BEFORE compile() (compiling twice corrupts the output).
+        if (stage != spv::ExecutionModelMax)
+        {
+            try
+            {
+                compiler.rename_entry_point(taskData.entryPoint, taskData.entryPoint, stage);
+            }
+            catch (const std::exception&)
+            {
+                // no such entry point name; spirv-cross default naming still works
+                // (nvrhi falls back to the single function in the library)
+            }
+        }
+
+        std::string msl = compiler.compile();
+
+        // Emit the compute threadgroup size as a marker comment; the nvrhi Metal
+        // backend reads it to size dispatchThreadgroups (MSL kernels don't carry it).
+        if (stage == spv::ExecutionModelGLCompute)
+        {
+            try
+            {
+                auto& ep = compiler.get_entry_point(taskData.entryPoint, spv::ExecutionModelGLCompute);
+                char marker[128];
+                snprintf(marker, sizeof(marker), "// nvrhi-threadgroup-size: %u %u %u\n",
+                    ep.workgroup_size.x, ep.workgroup_size.y, ep.workgroup_size.z);
+                msl = marker + msl;
+            }
+            catch (const std::exception&)
+            {
+                // entry point not found by that name; spirv-cross output still works
+            }
+        }
+
+        FILE* out = fopen(mslFile, "wb");
+        if (!out)
+        {
+            msg << "Failed to open '" << mslFile << "' for writing\n";
+            return false;
+        }
+        fwrite(msl.data(), 1, msl.size(), out);
+        fclose(out);
+
+        fs::remove(spirvFile);
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        msg << "spirv-cross error: " << e.what() << "\n";
+        return false;
+    }
+#endif
+}
+
 void ExeCompile()
 {
     static const char* optimizationLevelRemap[] = {
@@ -948,6 +1128,15 @@ void ExeCompile()
         }
 
         string outputFile = taskData.outputFileWithoutExt + g_OutputExt;
+
+        // For MSL the external compiler (DXC) emits an intermediate SPIR-V binary;
+        // the final .msl source is produced in-process by spirv-cross afterwards.
+        string compilerOutputFile = (g_Options.platform == MSL && !g_Options.slang)
+            ? taskData.outputFileWithoutExt + ".spv"
+            : outputFile;
+
+        bool isSucceeded = false;
+        bool willRetry = false;
 
         // Building command line
         ostringstream cmd;
@@ -1063,7 +1252,7 @@ void ExeCompile()
                 cmd << " -nologo";
 
                 // Output file
-                cmd << " -Fo " << EscapePath(outputFile);
+                cmd << " -Fo " << EscapePath(compilerOutputFile);
 
                 // Profile
                 string profile = taskData.profile + "_";
@@ -1114,7 +1303,7 @@ void ExeCompile()
                 if (g_Options.embedPdb)
                     cmd << " -Qembed_debug";
 
-                if (g_Options.platform == SPIRV)
+                if (g_Options.platform == SPIRV || g_Options.platform == MSL)
                 {
                     cmd << " -spirv";
 
@@ -1159,9 +1348,11 @@ void ExeCompile()
                     for (const string& options : taskData.compilerOptionsDXIL)
                         cmd << " " << options;
                 }
-                else if (g_Options.platform == SPIRV)
+                else if (g_Options.platform == SPIRV || g_Options.platform == MSL)
                 {
                     for (const string& options : taskData.compilerOptionsSPIRV)
+                        cmd << " " << options;
+                    for (const string& options : taskData.compilerOptionsMSL)
                         cmd << " " << options;
                 }
             }
@@ -1173,6 +1364,7 @@ void ExeCompile()
 
         cmd << " 2>&1";
 
+NextIteration:
         // Debug output
         if (g_Options.verbose)
             Printf(WHITE "%s\n", cmd.str().c_str());
@@ -1181,8 +1373,7 @@ void ExeCompile()
         ostringstream msg;
         FILE* pipe = popen(cmd.str().c_str(), "r");
 
-        bool isSucceeded = false;
-        bool willRetry = false;
+        willRetry = false;
         if (pipe)
         {
             char buf[BUF_SIZE];
@@ -1210,6 +1401,14 @@ void ExeCompile()
             // Retry if count > 0 and failed to execute child sub-process or command shell (posix only)
             else if (g_TaskRetryCount > 0 && (childProcessError || commandShellError))
                 willRetry = true;
+        }
+
+        // MSL: convert the intermediate SPIR-V to MSL source in-process
+        if (isSucceeded && g_Options.platform == MSL)
+        {
+            isSucceeded = ConvertSpirvToMsl(compilerOutputFile.c_str(), outputFile.c_str(), taskData, msg);
+            if (!isSucceeded)
+                Printf(RED "ERROR: MSL conversion failed for '%s': %s\n", outputFile.c_str(), msg.str().c_str());
         }
 
         // Convert to headers if needed
@@ -1505,6 +1704,7 @@ bool ProcessConfigLine(uint32_t lineIndex, const string& line, const fs::file_ti
     taskData.defines = configLine.defines;
     taskData.compilerOptionsDXIL = configLine.compilerOptionsDXIL;
     taskData.compilerOptionsSPIRV = configLine.compilerOptionsSPIRV;
+    taskData.compilerOptionsMSL = configLine.compilerOptionsMSL;
     taskData.optimizationLevel = optimizationLevel;
 
     // Gather blobs

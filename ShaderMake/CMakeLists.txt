@@ -53,3 +53,27 @@ elseif(APPLE)
 else()
     target_link_libraries(${PROJECT_NAME} stdc++fs pthread)
 endif()
+
+# Optional spirv-cross for the MSL platform (HLSL -> SPIR-V -> MSL in-process).
+option(SHADERMAKE_WITH_SPIRV_CROSS "Enable MSL output via spirv-cross" ON)
+if(SHADERMAKE_WITH_SPIRV_CROSS)
+    find_path(SPIRV_CROSS_INCLUDE_DIR spirv_cross/spirv_msl.hpp
+        PATHS /opt/local/include /usr/local/include /opt/homebrew/include)
+    find_library(SPIRV_CROSS_MSL_LIB spirv-cross-msl PATHS /opt/local/lib /usr/local/lib /opt/homebrew/lib)
+    find_library(SPIRV_CROSS_GLSL_LIB spirv-cross-glsl PATHS /opt/local/lib /usr/local/lib /opt/homebrew/lib)
+    find_library(SPIRV_CROSS_CORE_LIB spirv-cross-core PATHS /opt/local/lib /usr/local/lib /opt/homebrew/lib)
+    find_library(SPIRV_CROSS_UTIL_LIB spirv-cross-util PATHS /opt/local/lib /usr/local/lib /opt/homebrew/lib)
+    if(SPIRV_CROSS_INCLUDE_DIR AND SPIRV_CROSS_MSL_LIB AND SPIRV_CROSS_GLSL_LIB AND SPIRV_CROSS_CORE_LIB)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE SHADERMAKE_WITH_SPIRV_CROSS=1)
+        target_include_directories(${PROJECT_NAME} PRIVATE ${SPIRV_CROSS_INCLUDE_DIR})
+        # Link order matters for static libs: msl -> glsl -> core -> util
+        target_link_libraries(${PROJECT_NAME}
+            ${SPIRV_CROSS_MSL_LIB} ${SPIRV_CROSS_GLSL_LIB} ${SPIRV_CROSS_CORE_LIB})
+        if(SPIRV_CROSS_UTIL_LIB)
+            target_link_libraries(${PROJECT_NAME} ${SPIRV_CROSS_UTIL_LIB})
+        endif()
+        message(STATUS "ShaderMake: MSL output enabled (spirv-cross found)")
+    else()
+        message(STATUS "ShaderMake: spirv-cross not found, MSL output disabled")
+    endif()
+endif()
