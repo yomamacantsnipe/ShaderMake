@@ -995,6 +995,10 @@ bool ConvertSpirvToMsl(const char* spirvFile, const char* mslFile, const TaskDat
         spirv_cross::CompilerMSL::Options mslOptions;
         mslOptions.platform = spirv_cross::CompilerMSL::Options::macOS;
         mslOptions.msl_version = g_Options.mslVersion; // major*10000 + minor*100 + patch
+        // Emit native texture_buffer for Buffer<T>/RWBuffer<T> instead of the
+        // texture2d emulation; the nvrhi Metal backend binds texel-buffer views
+        // (MTLTextureTypeTextureBuffer), which must match the shader type.
+        mslOptions.texture_buffer_native = true;
         if (useArgumentBuffers)
         {
             mslOptions.argument_buffers = true;
@@ -1084,7 +1088,14 @@ bool ConvertSpirvToMsl(const char* spirvFile, const char* mslFile, const TaskDat
         for (const auto& r : res.storage_images)
         {
             uint32_t slot = compiler.get_decoration(r.id, spv::DecorationBinding) - g_Options.uRegShift;
-            addBinding(r.id, 0, 96 + slot, 0);
+            // Texel buffers (RWBuffer<T>) used with atomics get a synthesized
+            // device atomic_uint* alias taking this binding's msl_buffer index;
+            // point it at the UAV buffer slot so the runtime binder's raw
+            // buffer binding covers it (see bindBindingSetTo* TypedBuffer_UAV).
+            uint32_t mslBuffer = 0;
+            if (compiler.get_type(r.type_id).image.dim == spv::Dim::DimBuffer)
+                mslBuffer = 29 - slot;
+            addBinding(r.id, mslBuffer, 96 + slot, 0);
         }
         for (const auto& r : res.separate_samplers)
         {
