@@ -78,6 +78,7 @@ enum Platform : uint8_t
     DXIL,
     SPIRV,
     MSL,
+    METAL, // DXIL converted by Metal Shader Converter (nvrhi-metal-ir-convert)
 
     PLATFORMS_NUM
 };
@@ -128,6 +129,9 @@ struct Options
     bool slangHlsl = false;
     bool noRegShifts = false;
     bool compactProgress = false;
+
+    // METAL: the DXIL -> Metal converter executable
+    const char* metalConverter = nullptr;
 
     // MSL-specific options
     const char* mslTargetOS = "macOS";
@@ -192,25 +196,28 @@ atomic<uint32_t> g_FailedTaskCount = 0;
 uint32_t g_OriginalTaskCount;
 const char* g_OutputExt = nullptr;
 
-std::array<const char*, 4> g_PlatformNames = {
+std::array<const char*, PLATFORMS_NUM> g_PlatformNames = {
     "DXBC",
     "DXIL",
     "SPIRV",
     "MSL",
+    "METAL",
 };
 
-std::array<const char*, 4> g_PlatformExts = {
+std::array<const char*, PLATFORMS_NUM> g_PlatformExts = {
     ".dxbc",
     ".dxil",
     ".spirv",
     ".msl",
+    ".nvms",
 };
 
-std::array<const char*, 4> g_PlatformSlangTargets = {
+std::array<const char*, PLATFORMS_NUM> g_PlatformSlangTargets = {
     "dxbc",
     "dxil",
     "spirv",
     nullptr, // MSL not supported by Slang directly
+    nullptr, // METAL: DXC only
 };
 
 #if 1
@@ -643,7 +650,7 @@ bool Options::Parse(int32_t argc, const char** argv)
     struct argparse_option options[] = {
         OPT_HELP(),
         OPT_GROUP("Required options:"),
-            OPT_STRING('p', "platform", &platformName, "DXBC, DXIL, SPIRV or MSL", nullptr, 0, 0),
+            OPT_STRING('p', "platform", &platformName, "DXBC, DXIL, SPIRV, MSL or METAL", nullptr, 0, 0),
             OPT_STRING('c', "config", &config, "Configuration file with the list of shaders to compile", nullptr, 0, 0),
             OPT_STRING('o', "out", &outputDir, "Output directory", nullptr, 0, 0),
             OPT_BOOLEAN('b', "binary", &binary, "Output binary files", nullptr, 0, 0),
@@ -690,6 +697,8 @@ bool Options::Parse(int32_t argc, const char** argv)
             OPT_INTEGER(0, "bRegShift", &bRegShift, "SPIRV: register shift for constant (b#) resources", nullptr, 0, 0),
             OPT_INTEGER(0, "uRegShift", &uRegShift, "SPIRV: register shift for UAV (u#) resources", nullptr, 0, 0),
              OPT_BOOLEAN(0, "noRegShifts", &noRegShifts, "Don't specify any register shifts for the compiler", nullptr, 0, 0),
+         OPT_GROUP("METAL options:"),
+             OPT_STRING(0, "metalConverter", &metalConverter, "Path to nvrhi-metal-ir-convert, which turns the DXIL into a Metal shader container", nullptr, 0, 0),
          OPT_GROUP("MSL options:"),
              OPT_STRING(0, "mslTargetOS", &mslTargetOS, "Target OS for MSL (macOS, iOS, tvOS) (default = macOS)", nullptr, 0, 0),
              OPT_BOOLEAN(0, "mslTextureBuffer", &mslTextureBuffer, "Maps textures to buffer textures for MSL", nullptr, 0, 0),
@@ -778,6 +787,12 @@ bool Options::Parse(int32_t argc, const char** argv)
         g_OutputExt = outputExt;
     else
         g_OutputExt = g_PlatformExts[platform];
+
+    if (platform == METAL && (!metalConverter || slang))
+    {
+        Printf(RED "ERROR: the METAL platform needs DXC and --metalConverter!\n");
+        return false;
+    }
 
     if (g_Options.vulkanMemoryLayout && platform != SPIRV)
     {
@@ -1171,6 +1186,7 @@ bool ConvertSpirvToMsl(const char* spirvFile, const char* mslFile, const TaskDat
         return false;
     }
     } // for (useArgumentBuffers)
+    return false;
 #endif
 }
 
@@ -1200,9 +1216,12 @@ void ExeCompile()
 
         // For MSL the external compiler (DXC) emits an intermediate SPIR-V binary;
         // the final .msl source is produced in-process by spirv-cross afterwards.
-        string compilerOutputFile = (g_Options.platform == MSL && !g_Options.slang)
-            ? taskData.outputFileWithoutExt + ".spv"
-            : outputFile;
+        // For METAL it emits DXIL, which the Metal converter turns into the output.
+        string compilerOutputFile = outputFile;
+        if (g_Options.platform == MSL && !g_Options.slang)
+            compilerOutputFile = taskData.outputFileWithoutExt + ".spv";
+        else if (g_Options.platform == METAL)
+            compilerOutputFile = taskData.outputFileWithoutExt + ".intermediate.dxil";
 
         bool isSucceeded = false;
         bool willRetry = false;
@@ -1412,7 +1431,7 @@ void ExeCompile()
                     cmd << " " << options;
 
                 // Platform-specific custom options
-                if (g_Options.platform == DXIL)
+                if (g_Options.platform == DXIL || g_Options.platform == METAL)
                 {
                     for (const string& options : taskData.compilerOptionsDXIL)
                         cmd << " " << options;
@@ -1470,6 +1489,28 @@ NextIteration:
             // Retry if count > 0 and failed to execute child sub-process or command shell (posix only)
             else if (g_TaskRetryCount > 0 && (childProcessError || commandShellError))
                 willRetry = true;
+        }
+
+        // METAL: convert the intermediate DXIL with nvrhi-metal-ir-convert
+        if (isSucceeded && g_Options.platform == METAL)
+        {
+            ostringstream convert;
+            convert << EscapePath(g_Options.metalConverter)
+                    << " -T " << taskData.profile << "_" << taskData.shaderModel
+                    << " -E " << taskData.entryPoint
+                    << " -o " << EscapePath(outputFile)
+                    << " " << EscapePath(compilerOutputFile) << " 2>&1";
+            if (g_Options.verbose)
+                Printf(WHITE "%s\n", convert.str().c_str());
+            isSucceeded = false;
+            if (FILE* convertPipe = popen(convert.str().c_str(), "r"))
+            {
+                char buf[BUF_SIZE];
+                while (fgets(buf, sizeof(buf), convertPipe))
+                    msg << buf;
+                isSucceeded = pclose(convertPipe) == 0;
+            }
+            fs::remove(compilerOutputFile);
         }
 
         // MSL: convert the intermediate SPIR-V to MSL source in-process
@@ -1631,6 +1672,10 @@ bool ProcessConfigLine(uint32_t lineIndex, const string& line, const fs::file_ti
 
     // MSL: Metal has no geometry/tessellation/mesh shaders; skip those profiles
     if (g_Options.platform == MSL && (profile == "gs" || profile == "hs" || profile == "ds" || profile == "ms" || profile == "as" || profile == "lib"))
+        return true;
+
+    // METAL: the converter handles vertex, pixel and compute shaders so far
+    if (g_Options.platform == METAL && profile != "vs" && profile != "ps" && profile != "cs")
         return true;
 
     // Getting the sorted index of defines. While doing this, the value of defines are also get included in sorting problem
